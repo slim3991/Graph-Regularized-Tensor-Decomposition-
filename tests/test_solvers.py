@@ -1,12 +1,13 @@
 import unittest
 import warnings
+from unittest.mock import patch
 
 import numpy as np
 from scipy import sparse
 from scipy.linalg import solve_sylvester
 import tensorly as tl
 
-from src.grcp import global_cg_sylvester, graph_regularized_als
+from grcp import global_cg_sylvester, graph_regularized_als, unfolding_dot_khatri_rao
 
 
 def path_laplacian(size):
@@ -122,6 +123,63 @@ class TestALS(unittest.TestCase):
         weights, factors = cp
         self.assertEqual(weights.shape, (1,))
         self.assertEqual([factor.shape for factor in factors], [(4, 1), (3, 1), (2, 1)])
+
+    def test_initial_weights_absorbed_without_changing_reconstruction(self):
+        rng = np.random.default_rng(7)
+        weights = np.array([2., -3.])
+        factors = [rng.random((size, 2)) for size in self.X.shape]
+        expected = tl.cp_to_tensor((weights, factors))
+        with patch("grcp.tl.decomposition.parafac", return_value=(weights, factors)):
+            cp, residual = graph_regularized_als(self.X, 2, [None] * 3, n_iter=0)
+        np.testing.assert_array_equal(cp[0], np.ones(2))
+        np.testing.assert_allclose(tl.cp_to_tensor(cp), expected)
+        np.testing.assert_allclose(residual, self.X - expected)
+
+    def test_full_objective_decreases_without_rescaling(self):
+        rng = np.random.default_rng(7)
+        tensor = rng.random(self.X.shape)
+        initial = [rng.random((size, 2)) for size in tensor.shape]
+        for use_sparse in (False, True):
+            laps = [0.1 * path_laplacian(size) for size in tensor.shape]
+            if use_sparse:
+                laps = [sparse.csr_matrix(L) for L in laps]
+            objectives = []
+            for sweeps in range(6):
+                with patch(
+                    "grcp.tl.decomposition.parafac",
+                    return_value=(np.ones(2), [factor.copy() for factor in initial]),
+                ):
+                    cp, residual = graph_regularized_als(
+                        tensor, 2, laps, n_iter=sweeps, tol=1e-10
+                    )
+                np.testing.assert_array_equal(cp[0], np.ones(2))
+                penalty = sum(
+                    np.sum(factor * (L @ factor)) for factor, L in zip(cp[1], laps)
+                )
+                objectives.append(0.5 * (np.sum(residual**2) + penalty))
+            with self.subTest(sparse=use_sparse):
+                self.assertLess(objectives[-1], objectives[0])
+                self.assertTrue(np.all(np.diff(objectives) <= 1e-8), objectives)
+
+    def test_stopping_accounts_for_changing_graph_penalty(self):
+        initial = [np.ones((size, 1)) for size in self.X.shape]
+        initial[0][:, 0] = [1., 3., 1., 3.]
+        laps = [0.1 * path_laplacian(size) for size in self.X.shape]
+        # Hold reported reconstruction error at zero to isolate the graph term.
+        with (
+            patch("grcp.tl.decomposition.parafac", return_value=(np.ones(1), initial)),
+            patch("grcp.tl.cp_to_tensor", return_value=self.X.copy()),
+            patch("grcp.unfolding_dot_khatri_rao", wraps=unfolding_dot_khatri_rao) as updates,
+        ):
+            graph_regularized_als(self.X, 1, laps, n_iter=5, tol=1e-10)
+        self.assertGreater(updates.call_count, 3)
+
+    def test_singular_unregularized_update_without_ridge(self):
+        initial = [np.ones((size, 2)) for size in self.X.shape]
+        with patch("grcp.tl.decomposition.parafac", return_value=(np.ones(2), initial)):
+            cp, residual = graph_regularized_als(self.X, 2, [None] * 3, n_iter=2)
+        self.assertTrue(np.isfinite(tl.cp_to_tensor(cp)).all())
+        self.assertLess(np.linalg.norm(residual), 1e-8)
 
     def test_each_mode_accepts_dense_and_sparse_laplacians(self):
         original = self.X.copy()

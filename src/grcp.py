@@ -9,7 +9,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_array, check_is_fitted
 from tensorly.cp_tensor import unfolding_dot_khatri_rao
 
-type Tensor = tl.tensor | npt.NDArray
+type Tensor = npt.NDArray[np.floating]
 
 
 class MyGRTenDecomp(TransformerMixin, BaseEstimator):
@@ -81,6 +81,9 @@ def graph_regularized_als(
 
     Supply one dense or sparse matrix per mode, or None to disable that
     mode's graph penalty. Each matrix must match its mode's size.
+    CP weights stay at one and factors are not normalized during optimization.
+    Convergence uses relative change in the full objective: half the squared
+    reconstruction error plus half the sum of graph quadratic penalties.
     """
     if tensor.ndim != 3:
         raise ValueError("Expected a three-mode tensor.")
@@ -94,8 +97,21 @@ def graph_regularized_als(
     weights, factors = tl.decomposition.parafac(
         tensor, rank=rank, tol=tol, init="random"
     )
+    # Absorb component amplitudes once; subsequent updates keep unit weights.
+    if weights is not None:
+        factors[0] = factors[0] * weights[None, :]
+    weights = np.ones(rank, dtype=factors[0].dtype)
 
-    old_err = 1e10
+    def objective():
+        residual = tensor - tl.cp_to_tensor((weights, factors))
+        graph_penalty = sum(
+            np.sum(factor * (laplacian @ factor))
+            for factor, laplacian in zip(factors, laplacians)
+            if laplacian is not None
+        )
+        return 0.5 * (np.sum(residual**2) + graph_penalty)
+
+    old_objective = objective()
 
     for i in range(n_iter):
         for mode in range(3):
@@ -103,12 +119,12 @@ def graph_regularized_als(
             idx = [m for m in range(3) if m != mode]
             G1 = np.dot(factors[idx[0]].T, factors[idx[0]])
             G2 = np.dot(factors[idx[1]].T, factors[idx[1]])
-            S = G1 * G2 * (weights[:, None] * weights[None, :])
+            S = G1 * G2
 
             mttkrp = unfolding_dot_khatri_rao(tensor, (weights, factors), mode=mode)
 
             if laplacians[mode] is None:
-                factors[mode] = np.linalg.solve(S + 1e-8 * np.eye(rank), mttkrp.T).T
+                factors[mode] = np.linalg.lstsq(S, mttkrp.T, rcond=None)[0].T
             else:
                 X = factors[mode]
                 X = global_cg_sylvester(
@@ -122,27 +138,14 @@ def graph_regularized_als(
                 )
                 factors[mode] = X
 
-        for r in range(rank):
-            norm = 1.0
-            for mode in range(3):
-                col_norm = np.linalg.norm(factors[mode][:, r]) + 1e-12
-                factors[mode][:, r] /= col_norm
-                norm *= col_norm
-            weights[r] *= norm
-
-        if i == 0 or i % 4 == 0:
-            X_tensor = tl.cp_to_tensor((weights, factors))
-            res = tensor - X_tensor
-
-            err = np.linalg.norm(res) / tl.norm(tensor)
-            delta = np.abs(err - old_err)
-
-            if verbose:
-                print(f"Iter {i}, Error: {err:.4f}")
-
-            if delta < tol:
-                break
-            old_err = err
+        current_objective = objective()
+        delta = abs(current_objective - old_objective)
+        scale = max(abs(old_objective), np.finfo(float).eps)
+        if verbose:
+            print(f"Iter {i}, Objective: {current_objective:.6g}")
+        if delta <= tol * scale:
+            break
+        old_objective = current_objective
 
     return (weights, factors), (tensor - tl.cp_to_tensor((weights, factors)))
 

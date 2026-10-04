@@ -5,7 +5,7 @@ from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 from sklearn.utils.validation import check_is_fitted
 
-from src.grcp import MyGRTenDecomp
+from grcp import MyGRTenDecomp
 
 
 class TestWrapper(unittest.TestCase):
