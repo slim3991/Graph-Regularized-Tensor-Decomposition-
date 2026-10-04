@@ -5,6 +5,8 @@ decomposition of real, three-mode NumPy tensors. It includes an alternating
 least squares (ALS) solver, a conjugate gradient (CG) Sylvester solver, and a
 wrapper following sklearn estimator conventions.
 
+This is a small library adapted from my masters thesis
+
 ## Installation
 
 Requires Python 3.13 or newer. From the repository root:
