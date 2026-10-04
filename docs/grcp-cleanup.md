@@ -1,58 +1,89 @@
-# GRCP cleanup and remaining work
+# Graph-regularized CP
 
-The source file is `src/GRCP.py` (case-sensitive). The estimator currently
-supports finite, nonzero, three-dimensional real NumPy tensors and optional
-precomputed symmetric matrices, one per tensor mode. `transform(X)` returns
-the training reconstruction and requires the training shape. It does not fit
-a new tensor. `residuals(X)` subtracts that reconstruction from the supplied X.
+`src/GRCP.py` provides `MyGRTenDecomp`, `graph_regularized_als`, and
+`global_cg_sylvester`. Tensors may have two or more nonempty dimensions.
+Inputs must be finite real arrays. Integer arrays are converted to floating point.
 
-## Changes made
+## Objective and normalization
 
-- Corrected the NumPy type alias and scikit-learn fitted-state import.
-- Removed the unused time import and premature learned attributes.
-- Put TransformerMixin first in the inheritance list for scikit-learn mixin behavior.
-- Validate tensor shape, numeric values, rank, tolerance, and Laplacian dimensions
-  and symmetry before calling the solver; convert integer inputs to floating point.
-- Forward precomputed Laplacians and retain the CP tensor, reconstruction,
-  residual, Laplacians, and training shape as fitted attributes.
-- Return a copy of the reconstruction so callers cannot modify fitted state.
-- Raise NotImplementedError for requested graph construction or thresholding,
-  which were previously silently ignored. Empty graph parameters remain accepted.
-- Declare scikit-learn and update the dependency lockfile.
-- Add 11 unittest functionality tests, including a real decomposition and a
-  known Sylvester equation solution. Neither solver function was changed.
+ALS divides the input tensor by its Frobenius norm and minimizes
 
-## Remaining changes needed for the intended library
-
-The supported estimator path works in the tested cases. The following work is
-still needed for the broader intended functionality:
-
-1. Define and implement graph construction from `laplacian_parameters`, including
-   graph weights and regularization strength. Implement or remove
-   `local_threshold` and define the meaning of the former `threshold_` attribute.
-2. Decide whether to support arbitrary tensor order. ALS currently hardcodes
-   three modes and two other-mode Gram matrices. General support requires
-   products across all other modes; the wrapper currently rejects other orders.
-3. Harden direct solver calls: validate shapes and parameters, handle zero-norm
-   tensors in ALS, and handle `max_iter=0` in CG (its warning references an
-   undefined loop variable).
-4. Correct CG residual aliasing: `Z = R` followed by in-place `R` updates changes
-   Z before the next inner product. Copy the residual or restructure the update.
-   Also define ownership of `x0`, which is currently modified in place.
-5. Handle an initially converged CG solution, numerical breakdown, and exhausted
-   iterations distinctly. Validate the positive-definiteness assumptions for CG
-   and decide whether to activate the computed diagonal preconditioner.
-6. Define ALS convergence for the graph-regularized objective, rather than only
-   reconstruction error, expose iteration/status diagnostics, and implement or
-   remove unused verbosity options. Add numerical tests for these cases when
-   changing the solvers; the current smoke tests do not establish robustness.
-7. Add reproducible random initialization and define whether the estimator will
-   ever transform new observations rather than return its training reconstruction.
-8. Define an installable package layout and public API; imports currently use
-   `src.GRCP` from the repository root, and `main.py` is still a placeholder.
-
-Run tests from the repository root:
-
-```sh
-.venv/bin/python -m unittest discover -s tests -v
+```text
+0.5 * ||X / ||X||_F - CP(U_0, ..., U_d)||_F^2
++ 0.5 * sum_m lambda_m * trace(U_m.T @ L_m @ U_m)
 ```
+
+`regularization_strengths` supplies one finite nonnegative strength per mode.
+It defaults to ones. `laps` supplies one symmetric positive-semidefinite matrix
+per mode, or None to disable that mode's penalty. Strength zero also disables
+that penalty. Graph construction is not implemented: provide matrices directly.
+Neither Laplacians nor factor columns are normalized automatically.
+
+CP weights remain one during optimization. Factor rescaling was removed because
+it changes the graph penalty. Returned CP weights carry the input norm, so
+reconstructions and residuals are in the original input units. Diagnostics
+refer to the normalized objective. A zero tensor returns an exact zero solution.
+
+```python
+from src.GRCP import MyGRTenDecomp
+
+model = MyGRTenDecomp(
+    rank=3,
+    laps=[L0, L1, L2],
+    regularization_strengths=[0.1, 0.5, 0.0],
+    n_iter=500,
+    random_state=42,
+).fit(X)
+reconstruction = model.transform(X)
+residual = model.residuals(X)
+print(model.converged_, model.n_iter_, model.objective_history_)
+```
+
+`transform` returns a copy of the training reconstruction and requires the
+training shape. It does not fit new observations. Graph-construction parameters
+and local thresholding raise NotImplementedError when requested.
+
+## Solver behavior
+
+ALS supports arbitrary tensor order, uses least squares for unregularized mode
+updates, and CG for regularized Sylvester updates. Convergence uses the relative
+change in the full objective after every sweep. Random initialization is
+reproducible with `random_state`; the default iteration budget is now 100.
+
+The default direct ALS return remains `(cp_tensor, residual)`.
+`return_info=True` adds a diagnostics dictionary with objective, reconstruction
+error and graph-penalty histories, iteration count, status, input norm, and CG
+statuses. The estimator exposes this as `diagnostics_` and also exposes
+`tensor_norm_`, `objective_history_`, `n_iter_`, and `converged_`.
+
+CG solves `A @ X + X @ B = C` using the Frobenius inner product. Real symmetric
+A and B give a self-adjoint operator. Positive definiteness guarantees a unique
+solution; consistent positive-semidefinite systems may also converge. Negative
+operator eigenvalues are rejected. CG checks the initial residual, preserves
+all caller inputs, and stops when the actual residual norm is at most
+`max(atol, tol * ||C||_F)`. The unused preconditioner was removed.
+
+Its default return remains the solution array. `return_info=True` returns
+`(solution, diagnostics)`, with convergence, iteration count, residual norm, and
+status: converged, max_iter, breakdown, or numerical_failure. A zero iteration
+budget is supported. Both solvers warn on nonconvergence; ALS also reports an
+inner_solver_failed status if a CG update fails.
+
+## Tests and remaining limitations
+
+Run `.venv/bin/python -m unittest discover -s tests -v` from the repository root.
+Tests cover reconstruction, residuals, normalization and scale invariance,
+reproducibility, objective decrease and graph smoothing, per-mode penalties,
+zero tensors, higher orders, scikit-learn cloning, validation, CG agreement with
+SciPy, singular systems, exact initial guesses, and iteration exhaustion.
+
+The problem remains nonconvex and ALS does not guarantee a global optimum.
+Laplacian nullspaces and unpenalized modes can permit factor-scale degeneracies;
+input normalization does not remove those ambiguities. Additional constraints
+or coercive factor penalties would change the agreed objective and have not
+been introduced. Matrix validation uses dense eigenvalue calculations, so
+large sparse graphs need a separate implementation.
+
+Graph construction, thresholding, and an installable package/public API remain
+future work. The old note identifying `Z = R` as a CG aliasing defect was
+incorrect: that assignment is valid for the unpreconditioned recurrence.

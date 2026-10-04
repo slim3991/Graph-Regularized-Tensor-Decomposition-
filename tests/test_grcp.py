@@ -1,4 +1,8 @@
 import unittest
+import warnings
+
+import tensorly as tl
+from scipy.linalg import solve_sylvester
 from unittest.mock import patch
 
 import numpy as np
@@ -36,8 +40,8 @@ class EstimatorTests(unittest.TestCase):
             model.transform(np.ones((3, 3, 3)))
 
     def test_invalid_tensors(self):
-        for tensor in [np.ones((2, 2)), np.empty((0, 2, 2)),
-                       np.zeros((2, 2, 2)), np.full((2, 2, 2), np.nan),
+        for tensor in [np.ones(2), np.empty((0, 2, 2)),
+                       np.full((2, 2, 2), np.nan),
                        np.full((2, 2, 2), np.inf), np.ones((2, 2, 2), complex),
                        np.full((2, 2, 2), "bad")]:
             with self.subTest(shape=tensor.shape, dtype=tensor.dtype):
@@ -66,7 +70,7 @@ class EstimatorTests(unittest.TestCase):
 
     def test_laplacians_reach_solver(self):
         lap = np.array([[1., -1.], [-1., 1.]])
-        model = MyGRTenDecomp(rank=1, laps=[lap, None, None])
+        model = MyGRTenDecomp(rank=1, laps=[lap, None, None], random_state=0, regularization_strengths=[0., 0., 0.])
         with patch("src.GRCP.graph_regularized_als", wraps=graph_regularized_als) as solver:
             model.fit(self.tensor)
         np.testing.assert_array_equal(solver.call_args.kwargs["laps"][0], lap)
@@ -84,6 +88,137 @@ class EstimatorTests(unittest.TestCase):
         expected = np.array([[1., 2.], [3., 4.]])
         C = A @ expected + expected @ B
         np.testing.assert_allclose(global_cg_sylvester(A, B, C), expected, atol=1e-6)
+
+
+class NumericalTests(unittest.TestCase):
+    def test_distinct_strengths_apply_to_each_mode(self):
+        tensor = np.arange(1., 13.).reshape(2, 3, 2)
+        laps = [np.eye(size) for size in tensor.shape]
+        strengths = [0.01, 0.02, 0.03]
+        with patch("src.GRCP.global_cg_sylvester", wraps=global_cg_sylvester) as cg:
+            cp, _, info = graph_regularized_als(
+                tensor, 1, laps=laps, regularization_strengths=strengths,
+                random_state=0, n_iter=1000, return_info=True,
+            )
+        self.assertTrue(info["converged"])
+        for mode, call in enumerate(cg.call_args_list[:3]):
+            np.testing.assert_allclose(call.args[0], strengths[mode] * laps[mode])
+        expected_penalty = 0.5 * sum(
+            strength * np.sum(factor * (lap @ factor))
+            for strength, lap, factor in zip(strengths, laps, cp[1])
+        )
+        self.assertAlmostEqual(info["graph_penalty_history"][-1], expected_penalty)
+
+    def test_cg_matches_scipy_and_preserves_inputs(self):
+        rng = np.random.default_rng(2)
+        Q, T = rng.normal(size=(4, 4)), rng.normal(size=(3, 3))
+        A, B = Q.T @ Q + np.eye(4), T.T @ T + np.eye(3)
+        C = rng.normal(size=(4, 3))
+        initial = np.ones_like(C)
+        snapshots = [x.copy() for x in (A, B, C, initial)]
+        result, info = global_cg_sylvester(A, B, C, initial, tol=1e-10, return_info=True)
+        self.assertTrue(info['converged'])
+        np.testing.assert_allclose(result, solve_sylvester(A, B, C), atol=1e-9)
+        for value, snapshot in zip((A, B, C, initial), snapshots):
+            np.testing.assert_array_equal(value, snapshot)
+
+    def test_cg_exact_initial_and_zero_rhs(self):
+        A = B = np.eye(2)
+        for C, initial in [(np.zeros((2, 2)), None), (2 * np.ones((2, 2)), np.ones((2, 2)))]:
+            with warnings.catch_warnings(record=True) as caught:
+                result, info = global_cg_sylvester(A, B, C, initial, return_info=True)
+            self.assertFalse(caught)
+            self.assertEqual(info['n_iter'], 0)
+            self.assertTrue(info['converged'])
+            np.testing.assert_allclose(A @ result + result @ B, C)
+
+    def test_cg_scale_invariance(self):
+        expected = np.array([[1., 2.], [3., 4.]])
+        for scale in [1e-20, 1., 1e20]:
+            A, B = scale * np.diag([1., 2.]), scale * np.diag([3., 4.])
+            result = global_cg_sylvester(A, B, A @ expected + expected @ B, atol=0., tol=1e-10)
+            np.testing.assert_allclose(result, expected, atol=1e-8)
+
+    def test_cg_singular_and_exhausted_status(self):
+        A = np.diag([0., 1.])
+        B = np.zeros((2, 2))
+        _, info = global_cg_sylvester(A, B, np.array([[0., 0.], [1., 2.]]), return_info=True)
+        self.assertTrue(info['converged'])
+        with self.assertWarns(RuntimeWarning):
+            _, info = global_cg_sylvester(A, B, np.ones((2, 2)), return_info=True)
+        self.assertEqual(info['status'], 'breakdown')
+        for limit in [0, 1]:
+            with self.assertWarns(RuntimeWarning):
+                _, info = global_cg_sylvester(np.diag([1., 2.]), np.eye(2), np.ones((2, 2)), max_iter=limit, return_info=True)
+            self.assertEqual(info['status'], 'max_iter')
+            self.assertEqual(info['n_iter'], limit)
+
+    def test_cg_invalid_inputs(self):
+        for options in [dict(max_iter=-1), dict(tol=-1), dict(atol=np.nan), dict(x0=np.ones(2))]:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                global_cg_sylvester(np.eye(2), np.eye(2), np.ones((2, 2)), **options)
+        for A in [np.ones((2, 3)), np.array([[1., 1.], [0., 1.]]), -3 * np.eye(2)]:
+            with self.assertRaises(ValueError):
+                global_cg_sylvester(A, np.eye(2), np.ones((2, 2)))
+
+    def test_zero_tensor_and_general_orders(self):
+        for shape in [(2, 3), (2, 3, 2, 2)]:
+            model = MyGRTenDecomp(rank=1, random_state=0).fit(np.zeros(shape))
+            self.assertTrue(model.converged_)
+            np.testing.assert_array_equal(model.X_hat_, np.zeros(shape))
+            tensor = np.ones(shape)
+            np.testing.assert_allclose(MyGRTenDecomp(rank=1, random_state=0).fit_transform(tensor), tensor, atol=1e-8)
+
+    def test_als_scale_invariance_and_reproducibility(self):
+        tensor = np.arange(1., 13.).reshape(2, 3, 2)
+        cp, residual, info = graph_regularized_als(tensor, 1, random_state=3, return_info=True)
+        other, _, scaled_info = graph_regularized_als(10 * tensor, 1, random_state=3, return_info=True)
+        repeated, _, _ = graph_regularized_als(tensor, 1, random_state=3, return_info=True)
+        np.testing.assert_allclose(tl.cp_to_tensor(other), 10 * tl.cp_to_tensor(cp))
+        np.testing.assert_array_equal(tl.cp_to_tensor(cp), tl.cp_to_tensor(repeated))
+        np.testing.assert_allclose(info['objective_history'], scaled_info['objective_history'])
+        np.testing.assert_allclose(residual, tensor - tl.cp_to_tensor(cp))
+
+    def test_regularization_objective_and_smoothing(self):
+        tensor = np.einsum('i,j,k->ijk', [1., 3., 1.], [1., 2.], [2., 1.])
+        lap = np.array([[1., -1., 0.], [-1., 2., -1.], [0., -1., 1.]])
+        laps = [lap, np.eye(2), np.eye(2)]
+        results = []
+        for strength in [0., 0.1]:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                cp, _, info = graph_regularized_als(tensor, 1, n_iter=1000, laps=laps,
+                    regularization_strengths=[strength] * 3, random_state=4, return_info=True)
+            self.assertTrue(info['converged'])
+            history = np.array(info['objective_history'])
+            self.assertTrue(np.all(np.diff(history) <= 1e-10))
+            normalized_cp = (cp[0] / np.linalg.norm(tensor), cp[1])
+            error = 0.5 * np.linalg.norm(tensor / np.linalg.norm(tensor) - tl.cp_to_tensor(normalized_cp)) ** 2
+            penalty = 0.5 * sum(strength * np.sum(factor * (L @ factor)) for factor, L in zip(cp[1], laps))
+            self.assertAlmostEqual(info['objective_history'][-1], error + penalty)
+            self.assertAlmostEqual(info['graph_penalty_history'][-1], penalty)
+            reconstruction = tl.cp_to_tensor(cp)
+            results.append(np.sum(reconstruction * np.einsum('ij,jkl->ikl', lap, reconstruction)) / np.linalg.norm(reconstruction) ** 2)
+        self.assertLess(results[1], results[0])
+
+    def test_zero_strength_matches_no_graph(self):
+        tensor = np.arange(1., 9.).reshape(2, 2, 2)
+        plain, _ = graph_regularized_als(tensor, 1, random_state=0)
+        zero, _ = graph_regularized_als(tensor, 1, random_state=0, laps=[np.eye(2)] * 3, regularization_strengths=[0.] * 3)
+        np.testing.assert_allclose(tl.cp_to_tensor(plain), tl.cp_to_tensor(zero))
+
+    def test_als_invalid_inputs_and_iteration_status(self):
+        tensor = np.ones((2, 2, 2))
+        for options in [dict(n_iter=0), dict(rank=0), dict(tol=0),
+                        dict(regularization_strengths=[1., 2.]),
+                        dict(regularization_strengths=[1., -1., 1.]),
+                        dict(laps=[-np.eye(2), None, None])]:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                graph_regularized_als(tensor, **({'rank': 1} | options))
+        with self.assertWarns(RuntimeWarning):
+            _, _, info = graph_regularized_als(np.arange(1., 9.).reshape(2, 2, 2), 1, n_iter=1, random_state=0, return_info=True)
+        self.assertFalse(info['converged'])
+        self.assertEqual(info['n_iter'], 1)
 
 
 if __name__ == "__main__":
